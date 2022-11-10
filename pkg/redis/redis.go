@@ -14,19 +14,21 @@ import (
 // Silent disables verbose mode.
 // TTL enables TTL sync.
 type Redis struct {
-	Pool   *radix.Pool
-	Bus    message.Bus
-	Silent bool
-	TTL    bool
+	PoolSource *radix.Pool
+	PoolTarget *radix.Pool
+	Bus        message.Bus
+	Silent     bool
+	TTL        bool
 }
 
 // New creates the Redis struct, used to read/write.
-func New(source *radix.Pool, bus message.Bus, silent, ttl bool) *Redis {
+func New(source, target *radix.Pool, bus message.Bus, silent, ttl bool) *Redis {
 	return &Redis{
-		Pool:   source,
-		Bus:    bus,
-		Silent: silent,
-		TTL:    ttl,
+		PoolSource: source,
+		PoolTarget: target,
+		Bus:        bus,
+		Silent:     silent,
+		TTL:        ttl,
 	}
 }
 
@@ -48,7 +50,7 @@ func (r *Redis) maybeTTL(key string) (string, error) {
 	var ttl string
 
 	// Try getting key TTL.
-	err := r.Pool.Do(radix.Cmd(&ttl, "PTTL", key))
+	err := r.PoolSource.Do(radix.Cmd(&ttl, "PTTL", key))
 	if err != nil {
 		return ttl, err
 	}
@@ -69,31 +71,26 @@ func (r *Redis) maybeTTL(key string) (string, error) {
 func (r *Redis) Read(ctx context.Context) error {
 	defer close(r.Bus)
 
-	scanner := radix.NewScanner(r.Pool, radix.ScanAllKeys)
+	scanner := radix.NewScanner(r.PoolSource, radix.ScanAllKeys)
 
 	var key string
 	var value string
-	var ttl string
 
 	// Scan and push to bus until no keys are left.
 	// If context Done, exit early.
 	for scanner.Next(&key) {
-		err := r.Pool.Do(radix.Cmd(&value, "DUMP", key))
+		err := r.PoolSource.Do(radix.Cmd(&value, "DUMP", key))
 		if err != nil {
 			return err
 		}
 
-		ttl, err = r.maybeTTL(key)
-		if err != nil {
-			return err
-		}
-
+		// TTL is handled when writing so that we do not starve writers
 		select {
 		case <-ctx.Done():
 			fmt.Println("")
 			fmt.Println("redis read: exit")
 			return ctx.Err()
-		case r.Bus <- message.Payload{Key: key, Value: value, TTL: ttl}:
+		case r.Bus <- message.Payload{Key: key, Value: value, TTL: "0"}:
 			r.maybeLog("r")
 		}
 	}
@@ -118,8 +115,11 @@ func (r *Redis) Write(ctx context.Context) error {
 				r.Bus = nil
 				continue
 			}
-			err := r.Pool.Do(radix.Cmd(nil, "RESTORE", p.Key, p.TTL, p.Value, "REPLACE"))
+			ttl, err := r.maybeTTL(p.Key)
 			if err != nil {
+				return err
+			}
+			if err = r.PoolTarget.Do(radix.Cmd(nil, "RESTORE", p.Key, ttl, p.Value, "REPLACE")); err != nil {
 				return err
 			}
 			r.maybeLog("w")
